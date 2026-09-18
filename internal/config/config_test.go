@@ -771,3 +771,136 @@ func writeTempConfig(t *testing.T, content string) string {
 	}
 	return path
 }
+
+func clearCacheEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("MD2WECHAT_CACHE_ENABLED", "")
+	t.Setenv("MD2WECHAT_CACHE_DIR", "")
+	t.Setenv("MD2WECHAT_CACHE_TTL_DAYS", "")
+	t.Setenv("MD2WECHAT_CACHE_GRACE_DAYS", "")
+	t.Setenv("MD2WECHAT_NEAR_DUP_THRESHOLD", "")
+}
+
+func TestLoadWithDefaultsCacheDefaults(t *testing.T) {
+	clearCacheEnv(t)
+	path := writeTempConfig(t, `
+wechat:
+  appid: appid
+  secret: secret
+api:
+  convert_mode: api
+`)
+	cfg, err := LoadWithDefaults(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.CacheEnabled || cfg.CacheTTLDays != 7 || cfg.CacheGraceDays != 7 ||
+		cfg.NearDuplicateThreshold != 5 || cfg.CacheDir == "" {
+		t.Fatalf("cache defaults wrong: %+v", cfg)
+	}
+}
+
+func TestLoadWithDefaultsCacheFileAndEnv(t *testing.T) {
+	clearCacheEnv(t)
+	customDir := filepath.Join(t.TempDir(), "media-cache")
+	path := writeTempConfig(t, `
+wechat:
+  appid: appid
+  secret: secret
+api:
+  convert_mode: api
+cache:
+  enabled: false
+  dir: `+customDir+`
+  ttl_days: 3
+  grace_days: 2
+  near_duplicate_threshold: 8
+`)
+	cfg, err := LoadWithDefaults(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.CacheEnabled || cfg.CacheDir != customDir || cfg.CacheTTLDays != 3 ||
+		cfg.CacheGraceDays != 2 || cfg.NearDuplicateThreshold != 8 {
+		t.Fatalf("cache file mapping wrong: %+v", cfg)
+	}
+
+	// Env overrides file.
+	t.Setenv("MD2WECHAT_CACHE_ENABLED", "true")
+	t.Setenv("MD2WECHAT_CACHE_TTL_DAYS", "14")
+	envDir := filepath.Join(t.TempDir(), "env-cache")
+	t.Setenv("MD2WECHAT_CACHE_DIR", envDir)
+	cfg2, err := LoadWithDefaults(path)
+	if err != nil {
+		t.Fatalf("load env: %v", err)
+	}
+	if !cfg2.CacheEnabled || cfg2.CacheTTLDays != 14 || cfg2.CacheDir != envDir {
+		t.Fatalf("cache env override wrong: enabled=%v ttl=%d dir=%s", cfg2.CacheEnabled, cfg2.CacheTTLDays, cfg2.CacheDir)
+	}
+}
+
+func TestValidateCommonRejectsBadCacheValues(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			DefaultConvertMode:     "api",
+			MaxImageWidth:          1920,
+			MaxImageSize:           5 * 1024 * 1024,
+			HTTPTimeout:            30,
+			CacheEnabled:           true,
+			CacheTTLDays:           7,
+			CacheGraceDays:         7,
+			NearDuplicateThreshold: 5,
+			CacheDir:               "/tmp/media-cache",
+		}
+	}
+	for name, mutate := range map[string]func(*Config){
+		"negative ttl":       func(c *Config) { c.CacheTTLDays = -1 },
+		"negative grace":     func(c *Config) { c.CacheGraceDays = -1 },
+		"threshold over 64":  func(c *Config) { c.NearDuplicateThreshold = 65 },
+		"negative threshold": func(c *Config) { c.NearDuplicateThreshold = -1 },
+		"empty dir":          func(c *Config) { c.CacheDir = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base()
+			mutate(cfg)
+			if err := cfg.validateCommon(); err == nil {
+				t.Fatalf("expected rejection for %s", name)
+			}
+		})
+	}
+}
+
+func TestSaveConfigCacheRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cacheDir := filepath.Join(dir, "media-cache")
+	cfg := &Config{
+		WechatAppID:            "appid",
+		WechatSecret:           "secret",
+		DefaultConvertMode:     "api",
+		DefaultTheme:           "default",
+		DefaultBackgroundType:  "none",
+		ImageProvider:          "openai",
+		CompressImages:         true,
+		MaxImageWidth:          1920,
+		MaxImageSize:           5 * 1024 * 1024,
+		HTTPTimeout:            30,
+		CacheEnabled:           true,
+		CacheDir:               cacheDir,
+		CacheTTLDays:           9,
+		CacheGraceDays:         4,
+		NearDuplicateThreshold: 6,
+	}
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	clearCacheEnv(t)
+	loaded, err := LoadWithDefaults(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !loaded.CacheEnabled || loaded.CacheDir != cacheDir || loaded.CacheTTLDays != 9 ||
+		loaded.CacheGraceDays != 4 || loaded.NearDuplicateThreshold != 6 {
+		t.Fatalf("cache round trip wrong: %+v", loaded)
+	}
+}

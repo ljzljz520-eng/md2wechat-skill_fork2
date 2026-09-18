@@ -48,6 +48,13 @@ type Config struct {
 	// 超时配置
 	HTTPTimeout int `json:"http_timeout" yaml:"http_timeout" env:"HTTP_TIMEOUT"`
 
+	// 媒体缓存配置
+	CacheEnabled           bool   `json:"cache_enabled" yaml:"cache_enabled"`
+	CacheDir               string `json:"cache_dir" yaml:"cache_dir"`
+	CacheTTLDays           int    `json:"cache_ttl_days" yaml:"cache_ttl_days"`
+	CacheGraceDays         int    `json:"cache_grace_days" yaml:"cache_grace_days"`
+	NearDuplicateThreshold int    `json:"near_duplicate_threshold" yaml:"near_duplicate_threshold"`
+
 	// 配置文件路径（用于追踪）
 	configFile string
 }
@@ -86,6 +93,14 @@ type configFile struct {
 		MaxWidth int   `json:"max_width" yaml:"max_width"`
 		MaxSize  int   `json:"max_size_mb" yaml:"max_size_mb"`
 	} `json:"image" yaml:"image"`
+
+	Cache struct {
+		Enabled                *bool  `json:"enabled" yaml:"enabled"`
+		Dir                    string `json:"dir" yaml:"dir"`
+		TTLDays                int    `json:"ttl_days" yaml:"ttl_days"`
+		GraceDays              int    `json:"grace_days" yaml:"grace_days"`
+		NearDuplicateThreshold int    `json:"near_duplicate_threshold" yaml:"near_duplicate_threshold"`
+	} `json:"cache" yaml:"cache"`
 }
 
 var (
@@ -136,16 +151,22 @@ func LoadStrict() (*Config, error) {
 
 // LoadWithDefaults 使用指定配置文件路径加载配置
 func LoadWithDefaults(configPath string) (*Config, error) {
+	homeDir, _ := os.UserHomeDir()
 	cfg := &Config{
-		DefaultConvertMode:    "api",
-		DefaultTheme:          "default",
-		DefaultBackgroundType: "none",
-		MD2WechatBaseURL:      "https://www.md2wechat.cn",
-		CompressImages:        true,
-		MaxImageWidth:         1920,
-		MaxImageSize:          5 * 1024 * 1024, // 5MB
-		HTTPTimeout:           30,
-		ImageProvider:         "openai",
+		DefaultConvertMode:     "api",
+		DefaultTheme:           "default",
+		DefaultBackgroundType:  "none",
+		MD2WechatBaseURL:       "https://www.md2wechat.cn",
+		CompressImages:         true,
+		MaxImageWidth:          1920,
+		MaxImageSize:           5 * 1024 * 1024, // 5MB
+		HTTPTimeout:            30,
+		ImageProvider:          "openai",
+		CacheEnabled:           true,
+		CacheTTLDays:           7,
+		CacheGraceDays:         7,
+		NearDuplicateThreshold: 5,
+		CacheDir:               filepath.Join(homeDir, ".config", "md2wechat", "media-cache"),
 	}
 
 	// 1. 尝试从配置文件加载
@@ -413,6 +434,40 @@ func applyConfigFile(cfg *Config, cf *configFile) {
 	if cf.Image.MaxSize > 0 {
 		cfg.MaxImageSize = int64(cf.Image.MaxSize) * 1024 * 1024
 	}
+	if cf.Cache.Enabled != nil {
+		cfg.CacheEnabled = *cf.Cache.Enabled
+	}
+	if cf.Cache.Dir != "" {
+		cfg.CacheDir = expandHome(strings.TrimSpace(cf.Cache.Dir))
+	}
+	if cf.Cache.TTLDays > 0 {
+		cfg.CacheTTLDays = cf.Cache.TTLDays
+	}
+	if cf.Cache.GraceDays > 0 {
+		cfg.CacheGraceDays = cf.Cache.GraceDays
+	}
+	if cf.Cache.NearDuplicateThreshold > 0 {
+		cfg.NearDuplicateThreshold = cf.Cache.NearDuplicateThreshold
+	}
+}
+
+// expandHome expands a leading "~" to the user's home directory.
+func expandHome(path string) string {
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return path
+		}
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return path
+		}
+		return filepath.Join(home, path[2:])
+	}
+	return path
 }
 
 // loadFromEnv 从环境变量加载
@@ -471,6 +526,21 @@ func loadFromEnv(cfg *Config) {
 	if v := os.Getenv("HTTP_TIMEOUT"); v != "" {
 		cfg.HTTPTimeout = getEnvInt("HTTP_TIMEOUT", cfg.HTTPTimeout)
 	}
+	if v := os.Getenv("MD2WECHAT_CACHE_ENABLED"); v != "" {
+		cfg.CacheEnabled = getEnvBool("MD2WECHAT_CACHE_ENABLED", cfg.CacheEnabled)
+	}
+	if v := os.Getenv("MD2WECHAT_CACHE_DIR"); v != "" {
+		cfg.CacheDir = expandHome(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("MD2WECHAT_CACHE_TTL_DAYS"); v != "" {
+		cfg.CacheTTLDays = getEnvInt("MD2WECHAT_CACHE_TTL_DAYS", cfg.CacheTTLDays)
+	}
+	if v := os.Getenv("MD2WECHAT_CACHE_GRACE_DAYS"); v != "" {
+		cfg.CacheGraceDays = getEnvInt("MD2WECHAT_CACHE_GRACE_DAYS", cfg.CacheGraceDays)
+	}
+	if v := os.Getenv("MD2WECHAT_NEAR_DUP_THRESHOLD"); v != "" {
+		cfg.NearDuplicateThreshold = getEnvInt("MD2WECHAT_NEAR_DUP_THRESHOLD", cfg.NearDuplicateThreshold)
+	}
 }
 
 // Validate 验证配置
@@ -515,6 +585,34 @@ func (c *Config) validateCommon() error {
 	}
 	if err := validateWechatProxyURL(c.WechatProxyURL); err != nil {
 		return err
+	}
+	if c.CacheTTLDays < 0 {
+		return &ConfigError{
+			Field:   "CacheTTLDays",
+			Message: "缓存 TTL 不能为负数",
+			Hint:    "配置文件中设置 cache.ttl_days: 7",
+		}
+	}
+	if c.CacheGraceDays < 0 {
+		return &ConfigError{
+			Field:   "CacheGraceDays",
+			Message: "缓存宽限期不能为负数",
+			Hint:    "配置文件中设置 cache.grace_days: 7",
+		}
+	}
+	if c.NearDuplicateThreshold < 0 || c.NearDuplicateThreshold > 64 {
+		return &ConfigError{
+			Field:   "NearDuplicateThreshold",
+			Message: "近重复 Hamming 阈值必须在 0 到 64 之间",
+			Hint:    "配置文件中设置 cache.near_duplicate_threshold: 5",
+		}
+	}
+	if c.CacheDir == "" {
+		return &ConfigError{
+			Field:   "CacheDir",
+			Message: "媒体缓存目录不能为空",
+			Hint:    "配置文件中设置 cache.dir: ~/.config/md2wechat/media-cache",
+		}
 	}
 
 	return nil
@@ -722,25 +820,30 @@ func (c *Config) GetConfigFile() string {
 // ToMap 转换为 map 用于显示
 func (c *Config) ToMap(maskSecret bool) map[string]any {
 	result := map[string]any{
-		"wechat_appid":            c.WechatAppID,
-		"wechat_secret":           maskIf(c.WechatSecret, maskSecret),
-		"wechat_proxy_url":        maskProxyURLPassword(c.WechatProxyURL, maskSecret),
-		"wechat_account":          c.WechatAccount,
-		"default_convert_mode":    c.DefaultConvertMode,
-		"default_theme":           c.DefaultTheme,
-		"default_background_type": c.DefaultBackgroundType,
-		"md2wechat_api_key":       maskIf(c.MD2WechatAPIKey, maskSecret),
-		"md2wechat_base_url":      c.MD2WechatBaseURL,
-		"image_provider":          c.ImageProvider,
-		"image_api_key":           maskIf(c.ImageAPIKey, maskSecret),
-		"image_api_base":          c.ImageAPIBase,
-		"image_model":             c.ImageModel,
-		"image_size":              c.ImageSize,
-		"compress_images":         c.CompressImages,
-		"max_image_width":         c.MaxImageWidth,
-		"max_image_size_mb":       c.MaxImageSize / 1024 / 1024,
-		"http_timeout":            c.HTTPTimeout,
-		"config_file":             c.configFile,
+		"wechat_appid":             c.WechatAppID,
+		"wechat_secret":            maskIf(c.WechatSecret, maskSecret),
+		"wechat_proxy_url":         maskProxyURLPassword(c.WechatProxyURL, maskSecret),
+		"wechat_account":           c.WechatAccount,
+		"default_convert_mode":     c.DefaultConvertMode,
+		"default_theme":            c.DefaultTheme,
+		"default_background_type":  c.DefaultBackgroundType,
+		"md2wechat_api_key":        maskIf(c.MD2WechatAPIKey, maskSecret),
+		"md2wechat_base_url":       c.MD2WechatBaseURL,
+		"image_provider":           c.ImageProvider,
+		"image_api_key":            maskIf(c.ImageAPIKey, maskSecret),
+		"image_api_base":           c.ImageAPIBase,
+		"image_model":              c.ImageModel,
+		"image_size":               c.ImageSize,
+		"compress_images":          c.CompressImages,
+		"max_image_width":          c.MaxImageWidth,
+		"max_image_size_mb":        c.MaxImageSize / 1024 / 1024,
+		"http_timeout":             c.HTTPTimeout,
+		"cache_enabled":            c.CacheEnabled,
+		"cache_dir":                c.CacheDir,
+		"cache_ttl_days":           c.CacheTTLDays,
+		"cache_grace_days":         c.CacheGraceDays,
+		"near_duplicate_threshold": c.NearDuplicateThreshold,
+		"config_file":              c.configFile,
 	}
 	return result
 }
@@ -769,6 +872,12 @@ func SaveConfig(path string, cfg *Config) error {
 	cf.Image.Compress = &cfg.CompressImages
 	cf.Image.MaxWidth = cfg.MaxImageWidth
 	cf.Image.MaxSize = int(cfg.MaxImageSize / 1024 / 1024)
+	cacheEnabled := cfg.CacheEnabled
+	cf.Cache.Enabled = &cacheEnabled
+	cf.Cache.Dir = cfg.CacheDir
+	cf.Cache.TTLDays = cfg.CacheTTLDays
+	cf.Cache.GraceDays = cfg.CacheGraceDays
+	cf.Cache.NearDuplicateThreshold = cfg.NearDuplicateThreshold
 
 	var data []byte
 	var err error

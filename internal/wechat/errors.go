@@ -9,6 +9,51 @@ import (
 
 var errCodePattern = regexp.MustCompile(`\b([0-9]{5})\b`)
 
+// 微信失效类错误码：media_id 无效或素材已被删除。
+const (
+	// ErrCodeInvalidMediaID 不合法的 media_id / 素材不存在。
+	ErrCodeInvalidMediaID = 40007
+	// ErrCodeInvalidImage 图片素材无效。
+	ErrCodeInvalidImage = 40009
+)
+
+var invalidMediaCodes = map[int]struct{}{
+	ErrCodeInvalidMediaID: {},
+	ErrCodeInvalidImage:   {},
+}
+
+func isInvalidMediaCode(code int) bool {
+	_, ok := invalidMediaCodes[code]
+	return ok
+}
+
+// MediaErrorCode extracts the five-digit WeChat errcode embedded in err, when present.
+func MediaErrorCode(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	matches := errCodePattern.FindStringSubmatch(err.Error())
+	if len(matches) < 2 {
+		return 0, false
+	}
+	code, convErr := strconv.Atoi(matches[1])
+	if convErr != nil {
+		return 0, false
+	}
+	return code, true
+}
+
+// IsInvalidMediaError reports whether err is a WeChat response indicating that a
+// media_id is invalid or has been deleted. It is a pure observation used to drive
+// record invalidation; it never mutates state.
+func IsInvalidMediaError(err error) bool {
+	code, ok := MediaErrorCode(err)
+	if !ok {
+		return false
+	}
+	return isInvalidMediaCode(code)
+}
+
 // ExplainDraftAPIError converts known WeChat draft API errors into actionable hints.
 func ExplainDraftAPIError(code int, msg string) string {
 	base := fmt.Sprintf("wechat api error: %d - %s", code, msg)

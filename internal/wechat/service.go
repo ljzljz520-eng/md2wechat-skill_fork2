@@ -34,6 +34,14 @@ var (
 	wechatSDKHTTPClientMu sync.Mutex
 )
 
+const (
+	// getMaterialURL 获取永久素材接口（图片返回二进制流，失效返回 errcode JSON）。
+	getMaterialURL = "https://api.weixin.qq.com/cgi-bin/material/get_material"
+	// probePrefixBytes bounds how much of a get_material response is read purely
+	// to classify existence; error JSON is tiny, image binary only needs its first bytes.
+	probePrefixBytes = 4096
+)
+
 // Service 微信服务
 type Service struct {
 	cfg                *config.Config
@@ -43,6 +51,7 @@ type Service struct {
 	httpClientErr      error
 	sleep              func(time.Duration)
 	uploadMaterialFunc func(string) (*UploadMaterialResult, error)
+	probeMaterialFunc  func(context.Context, string) (bool, error)
 }
 
 // NewService 创建微信服务
@@ -249,6 +258,87 @@ func (s *Service) UploadMaterialWithRetry(filePath string, maxRetries int) (*Upl
 		}
 	}
 	return nil, lastErr
+}
+
+// MaterialExists 探测永久图片素材在微信端是否仍然存在。
+//   - (true, nil)：素材存在（二进制响应或 errcode=0）；
+//   - (false, nil)：微信明确返回失效类 errcode（素材已删除/ media_id 无效）；
+//   - (false, err)：探测本身失败（网络、非 200、未知 errcode），调用方不应据此判定失效。
+//
+// SDK v2.1.9 未封装图片素材的 get_material，因此按官方接口直接调用 HTTP。
+func (s *Service) MaterialExists(ctx context.Context, mediaID string) (bool, error) {
+	if s.probeMaterialFunc != nil {
+		return s.probeMaterialFunc(ctx, mediaID)
+	}
+	if strings.TrimSpace(mediaID) == "" {
+		return false, fmt.Errorf("probe material: media id is required")
+	}
+
+	var exists bool
+	err := s.withWechatSDKHTTPClient(func() error {
+		oa := s.getOfficialAccount()
+		accessToken, err := oa.GetAccessToken()
+		if err != nil {
+			return fmt.Errorf("get access token: %w", err)
+		}
+
+		reqBody, err := json.Marshal(struct {
+			MediaID string `json:"media_id"`
+		}{MediaID: mediaID})
+		if err != nil {
+			return fmt.Errorf("marshal probe request: %w", err)
+		}
+
+		apiURL := fmt.Sprintf("%s?access_token=%s", getMaterialURL, accessToken)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+		if err != nil {
+			return fmt.Errorf("build probe request: %w", err)
+		}
+
+		httpResp, err := s.getHTTPClient().Do(httpReq)
+		if err != nil {
+			return fmt.Errorf("probe material: %w", err)
+		}
+		defer func() {
+			_ = httpResp.Body.Close()
+		}()
+		if httpResp.StatusCode != http.StatusOK {
+			return fmt.Errorf("probe material: http status %d", httpResp.StatusCode)
+		}
+
+		prefix, err := io.ReadAll(io.LimitReader(httpResp.Body, probePrefixBytes))
+		if err != nil {
+			return fmt.Errorf("probe material: read response: %w", err)
+		}
+		trimmed := bytes.TrimSpace(prefix)
+		if len(trimmed) == 0 {
+			return fmt.Errorf("probe material: empty response")
+		}
+
+		// 图片素材存在时返回二进制流；失效时返回 JSON。
+		if trimmed[0] == '{' || trimmed[0] == '[' {
+			var common struct {
+				ErrCode int    `json:"errcode"`
+				ErrMsg  string `json:"errmsg"`
+			}
+			if err := json.Unmarshal(trimmed, &common); err != nil {
+				return fmt.Errorf("probe material: parse response: %w", err)
+			}
+			switch {
+			case common.ErrCode == 0:
+				exists = true
+			case isInvalidMediaCode(common.ErrCode):
+				exists = false
+			default:
+				return fmt.Errorf("probe material: wechat api error: %d - %s", common.ErrCode, common.ErrMsg)
+			}
+			return nil
+		}
+
+		exists = true
+		return nil
+	})
+	return exists, err
 }
 
 // DownloadFile 下载文件到临时目录，或返回本地文件路径
